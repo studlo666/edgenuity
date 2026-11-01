@@ -1,514 +1,1471 @@
-/**
- * EdgeSchool Pro - Automation Suite & Floating Controller
- * Hosted version for GitHub CDN / Raw loaders
- */
+// ==UserScript==
+// @name         StudySync Assist - Course Navigation & Form Helper
+// @namespace    https://github.com/studysync
+// @version      4.8
+// @description  Streamlined academic utility interface for automated navigation, quiz solving, math matching, and dashboard customization.
+// @author       StudySync Systems
+// @match        *://*.core.learn.edgenuity.com/*
+// @match        *://student.edgenuity.com/*
+// @match        *://*.student.edgenuity.com/*
+// @match        *://media.edgenuity.com/contentengine/frames/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_registerMenuCommand
+// @connect      generativelanguage.googleapis.com
+// @connect      media.edgenuity.com
+// @connect      core.learn.edgenuity.com
+// @connect      student.edgenuity.com
+// ==/UserScript==
+
 (function () {
   'use strict';
 
-  // Toggle or Cleanup if already running
-  if (window.__edg_master_loaded) {
-    var existingFrame = document.getElementById('edg-pixel-ui-frame');
-    if (existingFrame) existingFrame.remove();
-    var existingDock = document.getElementById('edg-pixel-dock');
-    if (existingDock) existingDock.remove();
-    if (window.__edg_master_cleanup) window.__edg_master_cleanup();
-    window.__edg_master_loaded = false;
-    return;
+  function getStoredKeys() {
+    var raw = GM_getValue('PROVIDER_KEY', '') || GM_getValue('GEMINI_API_KEY', '');
+    return raw.split(',').map(function (k) { return k.trim(); }).filter(Boolean);
   }
 
-  window.__edg_master_loaded = true;
-
-  // Global State & Stats
-  window.__edg_state = {
-    autoClick: true,
-    skipIntros: true,
-    autoDefi: true,
-    antiAfk: true
-  };
-
-  window.__edg_stats = {
-    startTime: Date.now(),
-    slidesAdvanced: 0,
-    vocabCompleted: 0,
-    afkPings: 0
-  };
-
-  window.__edg_logs = [];
-
-  window.__edg_log = function (msg, type) {
-    type = type || 'info';
-    var d = new Date();
-    var time = [d.getHours(), d.getMinutes(), d.getSeconds()]
-      .map(function (n) { return n < 10 ? '0' + n : n; })
-      .join(':');
-    window.__edg_logs.unshift({ time: time, msg: msg, type: type });
-    if (window.__edg_logs.length > 100) window.__edg_logs.pop();
-    if (window.__edg_on_log) window.__edg_on_log();
-  };
-
-  // Timer Management
-  var activeTimers = [];
-  function addTimer(fn, interval) {
-    var id = setInterval(fn, interval);
-    activeTimers.push(id);
-    return id;
+  var currentKeyIndex = 0;
+  function getActiveKey() {
+    var keys = getStoredKeys();
+    if (!keys.length) return '';
+    return keys[currentKeyIndex % keys.length];
   }
 
-  window.__edg_master_cleanup = function () {
-    activeTimers.forEach(clearInterval);
-    activeTimers = [];
-  };
+  function rotateKey() {
+    var keys = getStoredKeys();
+    if (keys.length > 1) {
+      currentKeyIndex = (currentKeyIndex + 1) % keys.length;
+      if (window.__ss_log) window.__ss_log('Switched to secondary API key slot ' + (currentKeyIndex + 1), 'info');
+    }
+  }
 
-  // 1. Create Dock Button
-  var dock = document.getElementById('edg-pixel-dock');
-  if (dock) dock.remove();
-  dock = document.createElement('div');
-  dock.id = 'edg-pixel-dock';
-  Object.assign(dock.style, {
-    position: 'fixed',
-    right: '20px',
-    bottom: '20px',
-    zIndex: '2147483647',
-    display: 'none'
+  function setStoredKeys(keyString) {
+    GM_setValue('PROVIDER_KEY', keyString.trim());
+    GM_setValue('GEMINI_API_KEY', keyString.trim());
+  }
+
+  // Cross-frame messaging
+  window.addEventListener('message', function (e) {
+    if (e.data === 'SS_PANIC_DESTROY') {
+      executeSelfDestruct();
+    }
+    if (e.data === 'SS_SHOW_UI' && window === window.top) {
+      toggleInterface();
+    }
   });
-  dock.innerHTML = `
-    <button id="edg-dock-btn" title="Restore EdgeSchool" style="width:48px;height:48px;border-radius:14px;background:#174ea6;color:#fff;border:0;box-shadow:0 4px 12px rgba(0,0,0,0.25);cursor:pointer;display:grid;place-items:center;transition:transform 0.2s cubic-bezier(0.16,1,0.3,1)">
-      <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-        <path d="M5 13.18v4L12 21l7-3.82v-4L12 17l-7-3.82zM12 3L1 9l11 6 9-4.91V17h2V9L12 3z"/>
-      </svg>
-    </button>`;
-  document.documentElement.appendChild(dock);
 
-  // 2. Create Floating UI Frame
-  var frame = document.getElementById('edg-pixel-ui-frame');
-  if (frame) frame.remove();
-  frame = document.createElement('iframe');
-  frame.id = 'edg-pixel-ui-frame';
-  Object.assign(frame.style, {
-    position: 'fixed',
-    left: '50%',
-    top: '45%',
-    transform: 'translate(-50%, -50%) scale(0.9)',
-    width: 'min(640px, calc(100vw - 28px))',
-    height: 'min(480px, calc(100vh - 40px))',
-    minWidth: '320px',
-    minHeight: '260px',
-    border: '1px solid #c5ccda',
-    borderRadius: '18px',
-    zIndex: '2147483647',
-    boxShadow: '0 18px 48px rgba(34,51,74,0.25)',
-    background: '#fff',
-    opacity: '0',
-    transition: 'transform 0.25s cubic-bezier(0.16,1,0.3,1), opacity 0.25s ease',
-    pointerEvents: 'none'
+  // Debounced Key Listeners (350ms cooldown)
+  var lastToggleTime = 0;
+  window.addEventListener('keydown', function (e) {
+    var now = Date.now();
+
+    // 1. Shift + / -> Show / Toggle Interface
+    if (e.shiftKey && (e.key === '?' || e.key === '/' || e.code === 'Slash')) {
+      e.preventDefault();
+      if (now - lastToggleTime < 350) return;
+      lastToggleTime = now;
+
+      if (window === window.top) {
+        toggleInterface();
+      } else {
+        window.top.postMessage('SS_SHOW_UI', '*');
+      }
+    }
+
+    // 2. Shift + \ -> Panic Kill Script Everywhere Instantly
+    if (e.shiftKey && (e.key === '|' || e.key === '\\' || e.code === 'Backslash')) {
+      e.preventDefault();
+      window.top.postMessage('SS_PANIC_DESTROY', '*');
+      for (var i = 0; i < window.frames.length; i++) {
+        try { window.frames[i].postMessage('SS_PANIC_DESTROY', '*'); } catch (_) {}
+      }
+      executeSelfDestruct();
+    }
   });
-  document.documentElement.appendChild(frame);
 
-  // 3. Inject UI Content
-  var doc = frame.contentDocument || frame.contentWindow.document;
-  doc.open();
-  doc.write(`<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <style>
-    * { box-sizing: border-box; margin:0; padding:0; font-family: system-ui, -apple-system, sans-serif; -webkit-user-select: none; user-select: none; }
-    body { height: 100vh; display: flex; flex-direction: column; background: #f8f9ff; color: #202124; overflow: hidden; }
-    .window { display: flex; flex-direction: column; height: 100vh; }
-    .titlebar { height: 46px; flex: none; display: flex; align-items: center; padding: 0 10px 0 14px; gap: 10px; background: #f8f9ff; border-bottom: 1px solid #e1e5ed; cursor: grab; }
-    .titlebar:active { cursor: grabbing; }
-    .appicon { width: 28px; height: 28px; border-radius: 8px; background: #d3e3fd; color: #174ea6; display: grid; place-items: center; font-size: 16px; }
-    .title { font-size: 13.5px; font-weight: 600; flex: 1; }
-    .controls { display: flex; gap: 3px; }
-    .control { border: 0; background: transparent; width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; color: #4b5260; cursor: pointer; transition: background .15s; font-size: 15px; }
-    .control:hover { background: #e8edf6; }
-    .control.close:hover { background: #fce8e6; color: #b3261e; }
-    .body { padding: 18px; flex: 1; overflow-y: auto; font-size: 13px; }
-    .eyebrow { font-size: 11px; font-weight: 600; letter-spacing: .06em; color: #687080; text-transform: uppercase; margin-bottom: 2px; }
-    h1 { font-size: 20px; margin-bottom: 6px; font-weight: 600; }
-    .sub { font-size: 12.5px; color: #626a78; margin-bottom: 12px; }
-    .badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; background: #e6f4ea; color: #137333; font-size: 11.5px; font-weight: 600; border-radius: 12px; margin-bottom: 12px; }
-    .badge.off { background: #fce8e6; color: #c5221f; }
-    .dot { width: 7px; height: 7px; border-radius: 50%; background: #1e8e3e; }
-    .badge.off .dot { background: #d93025; }
-    .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }
-    .stat-card { background: #fff; border: 1px solid #e1e5ed; border-radius: 10px; padding: 10px; text-align: center; }
-    .stat-card .val { font-size: 18px; font-weight: 700; color: #174ea6; }
-    .stat-card .lbl { font-size: 11px; color: #626a78; margin-top: 2px; }
-    .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-    .card { border-radius: 12px; background: #edf2fa; padding: 12px; border: 1px solid #e0e6ef; }
-    .card h3 { font-size: 13px; color: #174ea6; margin-bottom: 4px; }
-    .card p { font-size: 11.5px; color: #626a78; line-height: 1.35; }
-    .item { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; background: #fff; border-radius: 10px; border: 1px solid #e0e6ef; margin-bottom: 8px; }
-    .item label { font-size: 13px; font-weight: 500; cursor: pointer; }
-    .toggle { position: relative; display: inline-block; width: 36px; height: 20px; }
-    .toggle input { opacity: 0; width: 0; height: 0; }
-    .slider { position: absolute; cursor: pointer; inset: 0; background: #ccc; border-radius: 20px; transition: .2s; }
-    .slider:before { position: absolute; content: ""; height: 14px; width: 14px; left: 3px; bottom: 3px; background: white; border-radius: 50%; transition: .2s; }
-    input:checked + .slider { background: #174ea6; }
-    input:checked + .slider:before { transform: translateX(16px); }
-    .logs-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-    .btn-clear { border: 1px solid #d2d8e4; background: #fff; border-radius: 6px; padding: 3px 8px; font-size: 11.5px; cursor: pointer; color: #525967; }
-    .log-list { background: #1e222b; color: #e1e5ed; border-radius: 10px; padding: 10px; font-family: monospace; font-size: 11px; height: 240px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
-    .log-row { display: flex; gap: 6px; }
-    .log-time { color: #8894a7; }
-    .log-type-success { color: #81c995; }
-    .log-type-info { color: #8ab4f8; }
-    .log-type-warn { color: #fdd663; }
-    .bottom { flex: none; background: #eef1f7; border-top: 1px solid #e1e5ed; }
-    .navbar { height: 46px; display: flex; align-items: center; justify-content: space-around; padding: 0 12px; }
-    .navitem { border: 0; background: transparent; height: 32px; display: flex; align-items: center; gap: 6px; color: #525967; font-size: 12.5px; font-weight: 500; cursor: pointer; padding: 0 12px; border-radius: 6px; }
-    .navitem.active { color: #174ea6; background: #dfe8f5; font-weight: 600; }
-  </style>
-</head>
-<body>
-  <main class="window" id="win">
-    <header class="titlebar" id="drag">
-      <div class="appicon">&#127891;</div>
-      <div class="title">EdgeSchool Pro</div>
-      <div class="controls">
-        <button class="control" id="min" title="Minimize">&minus;</button>
-        <button class="control" id="max" title="Maximize">&#9633;</button>
-        <button class="control close" id="close" title="Close">&times;</button>
-      </div>
-    </header>
-    <section class="body" id="body"></section>
-    <footer class="bottom">
-      <div class="navbar">
-        <button class="navitem active" data-page="home">Home</button>
-        <button class="navitem" data-page="settings">Settings</button>
-        <button class="navitem" data-page="logs">Logs</button>
-      </div>
-    </footer>
-  </main>
-</body>
-</html>`);
-  doc.close();
+  function toggleInterface() {
+    if (window !== window.top) return;
+    var host = document.getElementById('studysync-container');
+    var dock = document.getElementById('studysync-dock');
+    if (!host) return;
 
-  // 4. UI View Logic & Events
-  var win = frame.contentWindow;
-  var bdoc = frame.contentDocument;
-  var body = bdoc.getElementById('body');
-  var drag = bdoc.getElementById('drag');
-  var dockBtn = document.getElementById('edg-dock-btn');
-  var maxed = false, restore = {}, currentPage = 'home';
-
-  setTimeout(function () {
-    frame.style.opacity = '1';
-    frame.style.transform = 'translate(-50%, -50%) scale(1)';
-    frame.style.pointerEvents = 'auto';
-  }, 10);
-
-  function minimizeWindow() {
-    frame.style.transform = 'translate(calc(50vw - 40px), calc(50vh - 40px)) scale(0.1)';
-    frame.style.opacity = '0';
-    frame.style.pointerEvents = 'none';
-    setTimeout(function () {
-      frame.style.display = 'none';
-      dock.style.display = 'block';
-    }, 250);
-  }
-
-  function restoreWindow() {
-    dock.style.display = 'none';
-    frame.style.display = 'block';
-    setTimeout(function () {
-      frame.style.transform = 'translate(-50%, -50%) scale(1)';
-      frame.style.opacity = '1';
-      frame.style.pointerEvents = 'auto';
-    }, 10);
-  }
-
-  bdoc.getElementById('min').onclick = minimizeWindow;
-  dockBtn.onclick = restoreWindow;
-
-  bdoc.getElementById('close').onclick = function () {
-    frame.style.opacity = '0';
-    frame.style.transform = 'translate(-50%, -50%) scale(0.9)';
-    setTimeout(function () {
-      frame.remove();
-      dock.remove();
-      if (window.__edg_master_cleanup) window.__edg_master_cleanup();
-      window.__edg_master_loaded = false;
-    }, 250);
-  };
-
-  bdoc.getElementById('max').onclick = function () {
-    if (!maxed) {
-      restore = {
-        left: frame.style.left,
-        top: frame.style.top,
-        width: frame.style.width,
-        height: frame.style.height,
-        transform: frame.style.transform
-      };
-      Object.assign(frame.style, {
-        left: '8px',
-        top: '8px',
-        transform: 'none',
-        width: 'calc(100vw - 16px)',
-        height: 'calc(100vh - 16px)'
-      });
-      maxed = true;
+    if (host.style.display === 'none') {
+      if (dock) dock.style.display = 'none';
+      host.style.display = 'block';
     } else {
-      Object.assign(frame.style, restore);
-      maxed = false;
+      host.style.display = 'none';
     }
-  };
-
-  // Draggable Handler
-  var dragging = false, sx = 0, sy = 0, rect = null;
-  drag.onmousedown = function (e) {
-    if (e.target.closest('button') || maxed) return;
-    dragging = true;
-    rect = frame.getBoundingClientRect();
-    frame.style.transition = 'none';
-    frame.style.transform = 'none';
-    frame.style.left = rect.left + 'px';
-    frame.style.top = rect.top + 'px';
-    sx = e.clientX;
-    sy = e.clientY;
-  };
-
-  function onDragMove(e) {
-    if (!dragging) return;
-    var dx = e.clientX - sx, dy = e.clientY - sy;
-    frame.style.left = (rect.left + dx) + 'px';
-    frame.style.top = (rect.top + dy) + 'px';
   }
 
-  function onDragEnd() {
-    dragging = false;
-    frame.style.transition = 'transform 0.25s cubic-bezier(0.16,1,0.3,1), opacity 0.25s ease';
+  function executeSelfDestruct() {
+    window.__ss_dead = true;
+
+    var host = document.getElementById('studysync-container');
+    if (host) host.remove();
+    var dock = document.getElementById('studysync-dock');
+    if (dock) dock.remove();
+
+    document.querySelectorAll('#ss-fill-btn').forEach(function(b) { b.remove(); });
+
+    if (window.__ss_mount_timer) {
+      clearInterval(window.__ss_mount_timer);
+      window.__ss_mount_timer = null;
+    }
+
+    if (window.__ss_timers && Array.isArray(window.__ss_timers)) {
+      window.__ss_timers.forEach(clearInterval);
+      window.__ss_timers = [];
+    }
+
+    if (window.__ss_spoof_timer) {
+      clearInterval(window.__ss_spoof_timer);
+      window.__ss_spoof_timer = null;
+    }
+
+    revertDashboardSpoof();
+
+    if (window.__ss_state) {
+      window.__ss_state.assistAutoFill = false;
+      window.__ss_state.navAdvance = false;
+      window.__ss_state.vocabHelper = false;
+      window.__ss_state.keepAlive = false;
+      window.__ss_state.enableSpoof = false;
+    }
+
+    for (var i = 0; i < window.frames.length; i++) {
+      try { window.frames[i].postMessage('SS_PANIC_DESTROY', '*'); } catch (_) {}
+    }
+
+    console.log('[StudySync] Terminated. Stock Edgenuity restored.');
   }
 
-  window.addEventListener('mousemove', onDragMove);
-  win.addEventListener('mousemove', onDragMove);
-  window.addEventListener('mouseup', onDragEnd);
-  win.addEventListener('mouseup', onDragEnd);
+  // =========================================================================
+  // SECTION 1: MATERIAL YOU CONTROLLER (Top-Level Window Only)
+  // =========================================================================
+  var isTopWindow = (window === window.top);
+  var isEdgenuityHost = window.location.hostname.includes('edgenuity.com');
 
-  // Formatting & Rendering
-  function formatUptime() {
-    var sec = Math.floor((Date.now() - window.__edg_stats.startTime) / 1000);
-    var m = Math.floor(sec / 60);
-    var s = sec % 60;
-    return m + 'm ' + s + 's';
-  }
+  if (isEdgenuityHost && isTopWindow) {
+    if (!window.__ss_loaded) {
+      window.__ss_loaded = true;
 
-  function renderHome() {
-    var stats = window.__edg_stats;
-    var state = window.__edg_state;
-    var isAnyActive = state.autoClick || state.autoDefi || state.skipIntros || state.antiAfk;
-    body.innerHTML = `
-      <div class="eyebrow">Controller Dashboard</div>
-      <h1>System Overview</h1>
-      <div class="badge ${isAnyActive ? '' : 'off'}">
-        <span class="dot"></span>${isAnyActive ? 'Automation Active' : 'Paused'}
-      </div>
-      <div class="stats-grid">
-        <div class="stat-card"><div class="val" id="val-uptime">${formatUptime()}</div><div class="lbl">Uptime</div></div>
-        <div class="stat-card"><div class="val">${stats.slidesAdvanced}</div><div class="lbl">Slides Advanced</div></div>
-        <div class="stat-card"><div class="val">${stats.vocabCompleted}</div><div class="lbl">Vocab Solved</div></div>
-      </div>
-      <div class="cards">
-        <article class="card"><h3>Auto Next</h3><p>Automatically progresses forward as soon as slides finish.</p></article>
-        <article class="card"><h3>Auto Vocab</h3><p>Detects matching terms, types answers, and submits questions.</p></article>
-        <article class="card"><h3>Skip Intros</h3><p>Bypasses blocking audio dialogs and overlay barriers.</p></article>
-        <article class="card"><h3>Anti-AFK</h3><p>Emits background heartbeats to prevent idle timeouts.</p></article>
-      </div>`;
-  }
+      window.__ss_state = {
+        assistAutoFill: GM_getValue('assistAutoFill', true),
+        autoCommit: GM_getValue('autoCommit', true),
+        navAdvance: GM_getValue('navAdvance', true),
+        clearOverlays: GM_getValue('clearOverlays', true),
+        vocabHelper: GM_getValue('vocabHelper', true),
+        keepAlive: GM_getValue('keepAlive', true),
+        delayProcessing: GM_getValue('delayProcessing', 2),
+        delayTransition: GM_getValue('delayTransition', 2),
+        enableSpoof: GM_getValue('enableSpoof', false),
+        spoofMode: GM_getValue('spoofMode', 'ahead'),
+        spoofType: GM_getValue('spoofType', 'random'),
+        spoofGrade: GM_getValue('spoofGrade', '97.5%'),
+        spoofMin: GM_getValue('spoofMin', 84),
+        spoofMax: GM_getValue('spoofMax', 98),
+        hideOverdue: GM_getValue('hideOverdue', true)
+      };
 
-  function renderSettings() {
-    var s = window.__edg_state;
-    body.innerHTML = `
-      <div class="eyebrow">Configuration</div>
-      <h1>Preferences</h1>
-      <p class="sub">Enable or disable automation modules in real time.</p>
-      <div class="item">
-        <label for="set-click">Auto-Advance Completed Slides</label>
-        <label class="toggle"><input type="checkbox" id="set-click" ${s.autoClick ? 'checked' : ''}><span class="slider"></span></label>
-      </div>
-      <div class="item">
-        <label for="set-skip">Skip Dialog & Intro Overlays</label>
-        <label class="toggle"><input type="checkbox" id="set-skip" ${s.skipIntros ? 'checked' : ''}><span class="slider"></span></label>
-      </div>
-      <div class="item">
-        <label for="set-defi">Auto Vocabulary / Defi Solver</label>
-        <label class="toggle"><input type="checkbox" id="set-defi" ${s.autoDefi ? 'checked' : ''}><span class="slider"></span></label>
-      </div>
-      <div class="item">
-        <label for="set-afk">Anti-Inactivity Heartbeat (Keep-Alive)</label>
-        <label class="toggle"><input type="checkbox" id="set-afk" ${s.antiAfk ? 'checked' : ''}><span class="slider"></span></label>
-      </div>`;
+      window.__ss_stats = {
+        startTime: Date.now(),
+        slidesNavigated: 0,
+        vocabSolved: 0,
+        inputsHandled: 0,
+        keepAlivePings: 0
+      };
 
-    bdoc.getElementById('set-click').onchange = function (e) {
-      s.autoClick = e.target.checked;
-      window.__edg_log('Auto-Advance ' + (s.autoClick ? 'enabled' : 'disabled'));
-    };
-    bdoc.getElementById('set-skip').onchange = function (e) {
-      s.skipIntros = e.target.checked;
-      window.__edg_log('Skip Intros ' + (s.skipIntros ? 'enabled' : 'disabled'));
-    };
-    bdoc.getElementById('set-defi').onchange = function (e) {
-      s.autoDefi = e.target.checked;
-      window.__edg_log('Auto Vocab ' + (s.autoDefi ? 'enabled' : 'disabled'));
-    };
-    bdoc.getElementById('set-afk').onchange = function (e) {
-      s.antiAfk = e.target.checked;
-      window.__edg_log('Anti-AFK ' + (s.antiAfk ? 'enabled' : 'disabled'));
-    };
-  }
+      window.__ss_logs = [];
+      window.__ss_timers = [];
 
-  function renderLogs() {
-    var logs = window.__edg_logs;
-    body.innerHTML = `
-      <div class="logs-header">
-        <div><div class="eyebrow">Console</div><h1>Event Stream</h1></div>
-        <button class="btn-clear" id="btn-clear-logs">Clear</button>
-      </div>
-      <div class="log-list" id="log-list">
-        ${logs.length
-          ? logs.map(function (l) {
-              return `<div class="log-row"><span class="log-time">[${l.time}]</span><span class="log-type-${l.type}">${l.msg}</span></div>`;
-            }).join('')
-          : '<div style="color:#687080;padding:12px;text-align:center">No events captured yet.</div>'
+      window.__ss_log = function (msg, type) {
+        if (window.__ss_dead) return;
+        type = type || 'info';
+        var d = new Date();
+        var time = [d.getHours(), d.getMinutes(), d.getSeconds()]
+          .map(function (n) { return n < 10 ? '0' + n : n; })
+          .join(':');
+        window.__ss_logs.unshift({ time: time, msg: msg, type: type });
+        if (window.__ss_logs.length > 75) window.__ss_logs.pop();
+        if (window.__ss_on_log) window.__ss_on_log();
+      };
+
+      function addLoop(fn, interval) {
+        var id = setInterval(function () {
+          if (!window.__ss_dead) fn();
+        }, interval);
+        window.__ss_timers.push(id);
+        return id;
+      }
+
+      // Dock Pill
+      var dock = document.createElement('div');
+      dock.id = 'studysync-dock';
+      Object.assign(dock.style, {
+        position: 'fixed',
+        right: '24px',
+        bottom: '24px',
+        zIndex: '2147483647',
+        display: 'none'
+      });
+      dock.innerHTML = `
+        <button id="ss-dock-btn" title="Open StudySync (Shift+/)" style="
+          width: 46px;
+          height: 46px;
+          border-radius: 16px;
+          background: #0b57d0;
+          color: #ffffff;
+          border: 2px solid rgba(255,255,255,0.7);
+          box-shadow: 0 4px 14px rgba(11,87,208,0.3);
+          cursor: pointer;
+          display: grid;
+          place-items: center;
+        ">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M12 3L1 9L12 15L21 10.09V17H23V9M5 13.18V17.18L12 21L19 17.18V13.18L12 17L5 13.18Z"/>
+          </svg>
+        </button>`;
+      document.body.appendChild(dock);
+
+      // Main Window
+      var host = document.createElement('div');
+      host.id = 'studysync-container';
+      var savedPos = GM_getValue('ss_window_pos', null);
+      var defLeft = Math.max(10, window.innerWidth - 530);
+      var defTop = 20;
+
+      var curLeft = savedPos ? savedPos.left : defLeft;
+      var curTop = savedPos ? savedPos.top : defTop;
+
+      Object.assign(host.style, {
+        position: 'fixed',
+        left: curLeft + 'px',
+        top: curTop + 'px',
+        width: '500px',
+        height: '520px',
+        zIndex: '2147483646',
+        display: 'block'
+      });
+      document.body.appendChild(host);
+
+      var shadow = host.attachShadow({ mode: 'open' });
+
+      var template = `
+        <style>
+          :host {
+            --md-sys-color-primary: #0b57d0;
+            --md-sys-color-on-primary: #ffffff;
+            --md-sys-color-surface: #f8fafd;
+            --md-sys-color-surface-container: #ffffff;
+            --md-sys-color-surface-container-high: #e9eef6;
+            --md-sys-color-outline: #c4c7c5;
+            --md-sys-color-outline-variant: #e1e3e1;
+            --md-sys-color-on-surface: #1f1f1f;
+            --md-sys-color-on-surface-variant: #444746;
+            --md-sys-color-error: #ba1a1a;
+          }
+          * { box-sizing: border-box; margin:0; padding:0; font-family: -apple-system, BlinkMacSystemFont, "Google Sans", "Segoe UI", Roboto, sans-serif; user-select: none; }
+          .window {
+            display: flex; flex-direction: column; height: 100%; width: 100%;
+            background: var(--md-sys-color-surface); color: var(--md-sys-color-on-surface);
+            border-radius: 24px; border: 1px solid var(--md-sys-color-outline-variant);
+            box-shadow: 0 12px 40px rgba(0,0,0,0.18), 0 2px 6px rgba(0,0,0,0.06);
+            overflow: hidden;
+          }
+          .header {
+            height: 48px; flex: none; display: flex; align-items: center;
+            padding: 0 16px; background: var(--md-sys-color-surface); border-bottom: 1px solid var(--md-sys-color-outline-variant);
+            cursor: grab; touch-action: none;
+          }
+          .header:active { cursor: grabbing; }
+          .brand { display: flex; align-items: center; gap: 10px; flex: 1; }
+          .brand-icon {
+            width: 28px; height: 28px; border-radius: 10px;
+            background: #d3e3fd; color: #041e49; display: grid; place-items: center;
+          }
+          .brand-title { font-size: 13.5px; font-weight: 600; color: #041e49; letter-spacing: -0.2px; }
+          .controls { display: flex; gap: 4px; }
+          .ctrl-btn {
+            border: 0; background: transparent; width: 30px; height: 30px; border-radius: 50%;
+            display: grid; place-items: center; color: var(--md-sys-color-on-surface-variant);
+            cursor: pointer; transition: background 0.15s ease;
+          }
+          .ctrl-btn:hover { background: var(--md-sys-color-surface-container-high); }
+          .ctrl-btn.close:hover { background: #ffdad6; color: var(--md-sys-color-error); }
+
+          .nav-tabs {
+            display: flex; gap: 6px; padding: 10px 16px 8px; background: var(--md-sys-color-surface);
+          }
+          .nav-pill {
+            border: 0; background: transparent; height: 32px; padding: 0 14px;
+            border-radius: 16px; font-size: 12px; font-weight: 500; color: var(--md-sys-color-on-surface-variant);
+            cursor: pointer; transition: all 0.2s cubic-bezier(0.2, 0, 0, 1);
+          }
+          .nav-pill.active {
+            background: #d3e3fd; color: #041e49; font-weight: 600;
+          }
+
+          .content { padding: 12px 16px; flex: 1; overflow-y: auto; font-size: 13px; }
+
+          .pill-status {
+            display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+            border-radius: 8px; font-size: 11.5px; font-weight: 600; margin-bottom: 12px;
+            background: #c4eed0; color: #072711;
+          }
+          .pill-status.paused { background: #ffdad6; color: #410002; }
+          .status-dot { width: 6px; height: 6px; border-radius: 50%; background: #146c2e; }
+          .pill-status.paused .status-dot { background: #ba1a1a; }
+
+          .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 12px; }
+          .stat-card {
+            background: var(--md-sys-color-surface-container); border-radius: 16px;
+            padding: 10px 6px; text-align: center; border: 1px solid var(--md-sys-color-outline-variant);
+          }
+          .stat-val { font-size: 16px; font-weight: 700; color: var(--md-sys-color-primary); }
+          .stat-lbl { font-size: 10px; color: var(--md-sys-color-on-surface-variant); margin-top: 2px; }
+
+          .banner-shortcut {
+            background: #e8f0fe; color: #174ea6; padding: 8px 12px; border-radius: 12px;
+            font-size: 11.5px; margin-bottom: 12px; display: flex; justify-content: space-between;
+          }
+          .banner-shortcut kbd {
+            background: #ffffff; padding: 2px 6px; border-radius: 6px;
+            border: 1px solid #d2e3fc; font-weight: 600; font-family: inherit; font-size: 11px;
+          }
+
+          .section-label { font-size: 11px; font-weight: 700; color: var(--md-sys-color-primary); margin: 12px 0 6px 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+          .setting-row {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 10px 14px; background: var(--md-sys-color-surface-container);
+            border-radius: 14px; border: 1px solid var(--md-sys-color-outline-variant); margin-bottom: 6px;
+          }
+          .setting-row label { font-size: 12.5px; font-weight: 500; cursor: pointer; flex: 1; }
+
+          .m3-switch { position: relative; width: 38px; height: 22px; flex: none; }
+          .m3-switch input { opacity: 0; width: 0; height: 0; }
+          .m3-slider {
+            position: absolute; cursor: pointer; inset: 0;
+            background: #e1e3e1; border-radius: 16px; border: 1px solid #747775; transition: 0.2s cubic-bezier(0.2, 0, 0, 1);
+          }
+          .m3-slider:before {
+            position: absolute; content: ""; height: 14px; width: 14px; left: 3px; bottom: 3px;
+            background: #747775; border-radius: 50%; transition: 0.2s cubic-bezier(0.2, 0, 0, 1);
+          }
+          input:checked + .m3-slider { background: #0b57d0; border-color: #0b57d0; }
+          input:checked + .m3-slider:before { background: #ffffff; transform: translateX(16px); }
+
+          .num-input, .select-input {
+            padding: 4px 8px; border: 1px solid var(--md-sys-color-outline);
+            border-radius: 8px; font-size: 12px; background: #ffffff; outline: none;
+          }
+          .num-input { width: 60px; text-align: center; }
+
+          .key-container {
+            background: var(--md-sys-color-surface-container); padding: 10px 12px;
+            border-radius: 14px; border: 1px solid var(--md-sys-color-outline-variant); margin-bottom: 8px;
+          }
+          .key-row { display: flex; gap: 8px; margin-top: 6px; }
+          .text-input {
+            flex: 1; border: 1px solid var(--md-sys-color-outline); border-radius: 8px;
+            padding: 6px 10px; font-size: 12px; outline: none; background: #ffffff;
+          }
+          .btn-m3 {
+            background: var(--md-sys-color-primary); color: #ffffff; border: 0;
+            border-radius: 8px; padding: 6px 14px; font-size: 12px; font-weight: 600; cursor: pointer;
+          }
+          .btn-m3.secondary { background: var(--md-sys-color-surface-container-high); color: var(--md-sys-color-on-surface); }
+          .btn-m3.danger { background: #ba1a1a; }
+
+          .log-box {
+            background: #1f1f1f; color: #f2f2f2; border-radius: 14px;
+            padding: 10px; font-family: ui-monospace, Menlo, Consolas, monospace;
+            font-size: 11px; height: 310px; overflow-y: auto; display: flex; flex-direction: column; gap: 5px;
+          }
+          .log-item { display: flex; gap: 6px; }
+          .log-t { color: #8e918f; }
+          .log-c-success { color: #6dd58c; }
+          .log-c-info { color: #a8c7fa; }
+          .log-c-warn { color: #f2b8b5; }
+        </style>
+        <div class="window">
+          <header class="header" id="drag-handle">
+            <div class="brand">
+              <div class="brand-icon">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M12 3L1 9L12 15L21 10.09V17H23V9M5 13.18V17.18L12 21L19 17.18V13.18L12 17L5 13.18Z"/>
+                </svg>
+              </div>
+              <div class="brand-title">StudySync Assist</div>
+            </div>
+            <div class="controls">
+              <button class="ctrl-btn" id="ctrl-min" title="Minimize to Dock">&minus;</button>
+              <button class="ctrl-btn close" id="ctrl-close" title="Hide UI (Shift+/ to restore)">&times;</button>
+            </div>
+          </header>
+
+          <nav class="nav-tabs">
+            <button class="nav-pill active" data-tab="overview">Overview</button>
+            <button class="nav-pill" data-tab="config">Configuration</button>
+            <button class="nav-pill" data-tab="activity">Activity Log</button>
+          </nav>
+
+          <section class="content" id="panel-content"></section>
+        </div>
+      `;
+      shadow.innerHTML = template;
+
+      var dragHandle = shadow.getElementById('drag-handle');
+      var panelContent = shadow.getElementById('panel-content');
+      var ctrlMin = shadow.getElementById('ctrl-min');
+      var ctrlClose = shadow.getElementById('ctrl-close');
+      var activeTab = 'overview';
+
+      var isDragging = false, sX = 0, sY = 0, initL = 0, initT = 0;
+
+      dragHandle.addEventListener('pointerdown', function (e) {
+        if (e.target.closest('button')) return;
+        isDragging = true;
+        dragHandle.setPointerCapture(e.pointerId);
+        sX = e.clientX;
+        sY = e.clientY;
+        initL = host.offsetLeft;
+        initT = host.offsetTop;
+      });
+
+      dragHandle.addEventListener('pointermove', function (e) {
+        if (!isDragging) return;
+        var nL = initL + (e.clientX - sX);
+        var nT = initT + (e.clientY - sY);
+
+        nL = Math.max(5, Math.min(window.innerWidth - host.offsetWidth - 5, nL));
+        nT = Math.max(5, Math.min(window.innerHeight - host.offsetHeight - 5, nT));
+
+        host.style.left = nL + 'px';
+        host.style.top = nT + 'px';
+      });
+
+      dragHandle.addEventListener('pointerup', function (e) {
+        if (isDragging) {
+          isDragging = false;
+          try { dragHandle.releasePointerCapture(e.pointerId); } catch (_) {}
+          GM_setValue('ss_window_pos', { left: host.offsetLeft, top: host.offsetTop });
         }
-      </div>`;
+      });
 
-    bdoc.getElementById('btn-clear-logs').onclick = function () {
-      window.__edg_logs.length = 0;
-      renderLogs();
-    };
+      ctrlMin.onclick = function () {
+        host.style.display = 'none';
+        dock.style.display = 'block';
+      };
+      dock.onclick = function () {
+        dock.style.display = 'none';
+        host.style.display = 'block';
+      };
+      ctrlClose.onclick = function () {
+        host.style.display = 'none';
+      };
+
+      function getUptime() {
+        var s = Math.floor((Date.now() - window.__ss_stats.startTime) / 1000);
+        return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+      }
+
+      function renderOverview() {
+        var stats = window.__ss_stats;
+        var state = window.__ss_state;
+        var isHalted = !!window.__ss_dead;
+        var isActive = !isHalted && (state.assistAutoFill || state.navAdvance || state.vocabHelper || state.keepAlive);
+
+        panelContent.innerHTML = `
+          <div id="status-pill" class="pill-status ${isActive ? '' : 'paused'}">
+            <span class="status-dot"></span>${isHalted ? 'Terminated' : (isActive ? 'System Running' : 'Idle')}
+          </div>
+
+          <div class="stats-grid">
+            <div class="stat-card"><div class="stat-val" id="disp-uptime">${getUptime()}</div><div class="stat-lbl">Uptime</div></div>
+            <div class="stat-card"><div class="stat-val">${stats.slidesNavigated}</div><div class="stat-lbl">Slides</div></div>
+            <div class="stat-card"><div class="stat-val">${stats.vocabSolved}</div><div class="stat-lbl">Vocab</div></div>
+            <div class="stat-card"><div class="stat-val">${stats.inputsHandled}</div><div class="stat-lbl">Inputs Filled</div></div>
+          </div>
+
+          <div class="banner-shortcut">
+            <span>Toggle UI: <kbd>Shift + /</kbd></span>
+            <span>Kill Script: <kbd>Shift + \\</kbd></span>
+          </div>
+
+          <div style="background:var(--md-sys-color-surface-container);padding:12px;border-radius:14px;border:1px solid var(--md-sys-color-outline-variant);">
+            <div style="font-size:12px;font-weight:600;margin-bottom:4px;">Dashboard Customizer Active</div>
+            <div style="font-size:11.5px;color:var(--md-sys-color-on-surface-variant);line-height:1.4;">
+              Status: ${state.enableSpoof ? (state.spoofMode === 'ahead' ? 'Ahead (#4caf50)' : 'On Target (#007bff)') : 'Disabled'}<br>
+              Grade Scoring: ${state.spoofType === 'random' ? ('Random range (' + state.spoofMin + '% - ' + state.spoofMax + '%)') : ('Fixed (' + state.spoofGrade + ')')}<br>
+              Overdue Alerts Hidden: ${state.hideOverdue ? 'Yes' : 'No'}
+            </div>
+          </div>`;
+      }
+
+      function renderConfig() {
+        var s = window.__ss_state;
+        var savedKey = (GM_getValue('PROVIDER_KEY', '') || GM_getValue('GEMINI_API_KEY', ''));
+
+        panelContent.innerHTML = `
+          <div class="section-label">Safety & Termination</div>
+          <div style="margin-bottom:8px;">
+            <button id="btn-panic" class="btn-m3 danger" style="width:100%;padding:9px;font-weight:600;">
+              Destroy Script & Restore Normal Edgenuity (Shift + \\)
+            </button>
+          </div>
+
+          <div class="section-label">Dashboard Visual Customizer</div>
+          <div class="setting-row">
+            <label for="cfg-spoof">Spoof Dashboard Grade & Progress</label>
+            <label class="m3-switch"><input type="checkbox" id="cfg-spoof" ${s.enableSpoof ? 'checked' : ''}><span class="m3-slider"></span></label>
+          </div>
+          <div class="setting-row">
+            <label for="cfg-spoof-mode">Target Visual Status</label>
+            <select id="cfg-spoof-mode" class="select-input">
+              <option value="ahead" ${s.spoofMode === 'ahead' ? 'selected' : ''}>Ahead (#4caf50 Green)</option>
+              <option value="ontarget" ${s.spoofMode === 'ontarget' ? 'selected' : ''}>On Target (#007bff Blue)</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <label for="cfg-spoof-type">Grade Scoring Mode</label>
+            <select id="cfg-spoof-type" class="select-input">
+              <option value="random" ${s.spoofType === 'random' ? 'selected' : ''}>Random Range (e.g. 80-100%)</option>
+              <option value="fixed" ${s.spoofType === 'fixed' ? 'selected' : ''}>Fixed Exact Grade</option>
+            </select>
+          </div>
+          <div class="setting-row" id="row-rand-grades" style="display:${s.spoofType === 'random' ? 'flex' : 'none'};">
+            <label>Random Range (Min - Max %)</label>
+            <div style="display:flex;gap:4px;align-items:center;">
+              <input type="number" id="cfg-spoof-min" class="num-input" min="50" max="99" value="${s.spoofMin}">
+              <span>-</span>
+              <input type="number" id="cfg-spoof-max" class="num-input" min="51" max="100" value="${s.spoofMax}">
+            </div>
+          </div>
+          <div class="setting-row" id="row-fixed-grade" style="display:${s.spoofType === 'fixed' ? 'flex' : 'none'};">
+            <label for="cfg-spoof-grade">Exact Fixed Grade</label>
+            <input type="text" id="cfg-spoof-grade" class="select-input" style="width:80px;text-align:center;" value="${s.spoofGrade}">
+          </div>
+          <div class="setting-row">
+            <label for="cfg-hide-overdue">Hide Overdue Alerts & Banners</label>
+            <label class="m3-switch"><input type="checkbox" id="cfg-hide-overdue" ${s.hideOverdue ? 'checked' : ''}><span class="m3-slider"></span></label>
+          </div>
+
+          <div class="section-label">Automated Input Processing</div>
+          <div class="setting-row">
+            <label for="cfg-fill">Automated Form Filling</label>
+            <label class="m3-switch"><input type="checkbox" id="cfg-fill" ${s.assistAutoFill ? 'checked' : ''}><span class="m3-slider"></span></label>
+          </div>
+          <div class="setting-row">
+            <label for="cfg-commit">Auto-Submit / Check Answers</label>
+            <label class="m3-switch"><input type="checkbox" id="cfg-commit" ${s.autoCommit ? 'checked' : ''}><span class="m3-slider"></span></label>
+          </div>
+          <div class="setting-row">
+            <label for="cfg-delay">Inspection Delay (seconds)</label>
+            <input type="number" id="cfg-delay" class="num-input" min="1" max="15" value="${s.delayProcessing}">
+          </div>
+
+          <div class="section-label">Navigation & Progression</div>
+          <div class="setting-row">
+            <label for="cfg-advance">Auto-Advance Completed Slides</label>
+            <label class="m3-switch"><input type="checkbox" id="cfg-advance" ${s.navAdvance ? 'checked' : ''}><span class="m3-slider"></span></label>
+          </div>
+          <div class="setting-row">
+            <label for="cfg-trans-delay">Slide Transition Delay (seconds)</label>
+            <input type="number" id="cfg-trans-delay" class="num-input" min="1" max="20" value="${s.delayTransition}">
+          </div>
+          <div class="setting-row">
+            <label for="cfg-overlays">Dismiss Intro Dialogs</label>
+            <label class="m3-switch"><input type="checkbox" id="cfg-overlays" ${s.clearOverlays ? 'checked' : ''}><span class="m3-slider"></span></label>
+          </div>
+          <div class="setting-row">
+            <label for="cfg-vocab">Automated Vocabulary Solver</label>
+            <label class="m3-switch"><input type="checkbox" id="cfg-vocab" ${s.vocabHelper ? 'checked' : ''}><span class="m3-slider"></span></label>
+          </div>
+          <div class="setting-row">
+            <label for="cfg-keepalive">Connection Keep-Alive</label>
+            <label class="m3-switch"><input type="checkbox" id="cfg-keepalive" ${s.keepAlive ? 'checked' : ''}><span class="m3-slider"></span></label>
+          </div>
+
+          <div class="section-label">API Quota & Multi-Key Setup</div>
+          <div class="key-container">
+            <label style="font-weight:600;font-size:11.5px;color:var(--md-sys-color-on-surface);">API Keys (comma-separated for auto-rotation)</label>
+            <div class="key-row">
+              <input type="password" id="key-input" class="text-input" placeholder="key1, key2, key3..." value="${savedKey}">
+              <button id="btn-save-key" class="btn-m3">Save</button>
+            </div>
+            <div style="font-size:10px;color:var(--md-sys-color-on-surface-variant);margin-top:4px;">
+              Paste 2-3 free keys separated by commas to bypass 15 RPM limits automatically.
+            </div>
+          </div>`;
+
+        shadow.getElementById('btn-panic').onclick = executeSelfDestruct;
+
+        shadow.getElementById('cfg-spoof').onchange = function (e) {
+          s.enableSpoof = e.target.checked;
+          GM_setValue('enableSpoof', s.enableSpoof);
+          if (s.enableSpoof) applyDashboardSpoof();
+          else revertDashboardSpoof();
+        };
+
+        shadow.getElementById('cfg-spoof-mode').onchange = function (e) {
+          s.spoofMode = e.target.value;
+          GM_setValue('spoofMode', s.spoofMode);
+          if (s.enableSpoof) applyDashboardSpoof();
+        };
+
+        shadow.getElementById('cfg-spoof-type').onchange = function (e) {
+          s.spoofType = e.target.value;
+          GM_setValue('spoofType', s.spoofType);
+          shadow.getElementById('row-rand-grades').style.display = (s.spoofType === 'random') ? 'flex' : 'none';
+          shadow.getElementById('row-fixed-grade').style.display = (s.spoofType === 'fixed') ? 'flex' : 'none';
+          if (s.enableSpoof) applyDashboardSpoof();
+        };
+
+        shadow.getElementById('cfg-spoof-min').onchange = function (e) {
+          s.spoofMin = parseInt(e.target.value) || 80;
+          GM_setValue('spoofMin', s.spoofMin);
+          if (s.enableSpoof) applyDashboardSpoof();
+        };
+
+        shadow.getElementById('cfg-spoof-max').onchange = function (e) {
+          s.spoofMax = parseInt(e.target.value) || 100;
+          GM_setValue('spoofMax', s.spoofMax);
+          if (s.enableSpoof) applyDashboardSpoof();
+        };
+
+        shadow.getElementById('cfg-spoof-grade').onchange = function (e) {
+          s.spoofGrade = e.target.value.trim();
+          GM_setValue('spoofGrade', s.spoofGrade);
+          if (s.enableSpoof) applyDashboardSpoof();
+        };
+
+        shadow.getElementById('cfg-hide-overdue').onchange = function (e) {
+          s.hideOverdue = e.target.checked;
+          GM_setValue('hideOverdue', s.hideOverdue);
+          if (s.enableSpoof) applyDashboardSpoof();
+          else revertDashboardSpoof();
+        };
+
+        shadow.getElementById('cfg-fill').onchange = function (e) { s.assistAutoFill = e.target.checked; GM_setValue('assistAutoFill', s.assistAutoFill); };
+        shadow.getElementById('cfg-commit').onchange = function (e) { s.autoCommit = e.target.checked; GM_setValue('autoCommit', s.autoCommit); };
+        shadow.getElementById('cfg-delay').onchange = function (e) { s.delayProcessing = Math.max(1, parseInt(e.target.value) || 2); GM_setValue('delayProcessing', s.delayProcessing); };
+        shadow.getElementById('cfg-advance').onchange = function (e) { s.navAdvance = e.target.checked; GM_setValue('navAdvance', s.navAdvance); };
+        shadow.getElementById('cfg-trans-delay').onchange = function (e) { s.delayTransition = Math.max(1, parseInt(e.target.value) || 2); GM_setValue('delayTransition', s.delayTransition); };
+        shadow.getElementById('cfg-overlays').onchange = function (e) { s.clearOverlays = e.target.checked; GM_setValue('clearOverlays', s.clearOverlays); };
+        shadow.getElementById('cfg-vocab').onchange = function (e) { s.vocabHelper = e.target.checked; GM_setValue('vocabHelper', s.vocabHelper); };
+        shadow.getElementById('cfg-keepalive').onchange = function (e) { s.keepAlive = e.target.checked; GM_setValue('keepAlive', s.keepAlive); };
+
+        shadow.getElementById('btn-save-key').onclick = function () {
+          var token = shadow.getElementById('key-input').value.trim();
+          setStoredKeys(token);
+          alert('API credentials updated (' + getStoredKeys().length + ' active key slots)!');
+          window.__ss_log('Saved API credentials', 'success');
+        };
+      }
+
+      function renderActivity() {
+        var logs = window.__ss_logs;
+        panelContent.innerHTML = `
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+            <div style="font-size:12px;font-weight:600;color:var(--md-sys-color-on-surface);">Recorded Actions</div>
+            <button id="btn-purge-logs" style="border:1px solid var(--md-sys-color-outline-variant);background:#fff;border-radius:6px;padding:3px 8px;font-size:11px;cursor:pointer;">Clear</button>
+          </div>
+          <div class="log-box">
+            ${logs.length
+              ? logs.map(function (l) {
+                  return `<div class="log-item"><span class="log-t">[${l.time}]</span><span class="log-c-${l.type}">${l.msg}</span></div>`;
+                }).join('')
+              : '<div style="color:#8e918f;padding:12px;text-align:center">No recorded activity yet.</div>'
+            }
+          </div>`;
+
+        shadow.getElementById('btn-purge-logs').onclick = function () {
+          window.__ss_logs.length = 0;
+          renderActivity();
+        };
+      }
+
+      window.__ss_on_log = function () {
+        if (activeTab === 'activity') renderActivity();
+        if (activeTab === 'overview') {
+          var el = shadow.getElementById('disp-uptime');
+          if (el) el.innerText = getUptime();
+        }
+      };
+
+      renderOverview();
+
+      setInterval(function () {
+        if (activeTab === 'overview') {
+          var el = shadow.getElementById('disp-uptime');
+          if (el) el.innerText = getUptime();
+        }
+      }, 1000);
+
+      shadow.querySelectorAll('.nav-pill').forEach(function (btn) {
+        btn.onclick = function () {
+          shadow.querySelectorAll('.nav-pill').forEach(function (b) { b.classList.toggle('active', b === btn); });
+          activeTab = btn.getAttribute('data-tab');
+          if (activeTab === 'overview') renderOverview();
+          else if (activeTab === 'config') renderConfig();
+          else if (activeTab === 'activity') renderActivity();
+        };
+      });
+
+      // Progression Loop
+      var isStepping = false;
+      addLoop(function () {
+        if (window.__ss_dead || !window.__ss_state.navAdvance) return;
+
+        var activityNav = document.querySelector('.footnav.goRight:not(.disabled)');
+        if (activityNav) {
+          activityNav.click();
+          window.__ss_stats.slidesNavigated++;
+          window.__ss_log('Progressed forward to next lesson module', 'success');
+          return;
+        }
+
+        try {
+          var innerIframe = document.querySelector('iframe:not(#studysync-container iframe)');
+          if (innerIframe && innerIframe.contentWindow && innerIframe.contentWindow.API && innerIframe.contentWindow.API.E2020) {
+            if (!innerIframe.contentWindow.API.E2020.freeMovement) {
+              innerIframe.contentWindow.API.E2020.freeMovement = true;
+            }
+          }
+        } catch (_) {}
+
+        var currentSlide = document.querySelector('.FrameCurrent.FrameComplete');
+        var slideArrow = document.querySelector('.FrameRight');
+        if (currentSlide && slideArrow && !isStepping) {
+          isStepping = true;
+          slideArrow.click();
+          window.__ss_stats.slidesNavigated++;
+          window.__ss_log('Navigated forward to completed slide', 'success');
+          setTimeout(function () { isStepping = false; }, 1000);
+        }
+      }, 1000);
+
+      // Overlays Cleanup
+      addLoop(function () {
+        if (window.__ss_dead || !window.__ss_state.clearOverlays) return;
+        var invis = document.getElementById('invis-o-div');
+        if (invis) invis.remove();
+        var err = document.getElementById('uid1_errorMessage');
+        if (err) err.remove();
+      }, 1500);
+
+      // Vocabulary Helper
+      var vocabPlayed = false;
+      addLoop(function () {
+        if (window.__ss_dead || !window.__ss_state.vocabHelper) return;
+        var normalBox = document.querySelector('.word-textbox.word-normal');
+        var correctBox = document.querySelector('.word-textbox.word-correct');
+        var textBtn = document.querySelector('.plainbtn.alt.blue.selected');
+        var playDefBtn = document.querySelector('.playbutton.vocab-play');
+        var nextBtn = document.querySelector('.uibtn.uibtn-blue.uibtn-arrow-next');
+
+        if (normalBox && !correctBox && textBtn) {
+          normalBox.value = textBtn.textContent || textBtn.innerText;
+          vocabPlayed = false;
+          normalBox.dispatchEvent(new Event('keyup', { bubbles: true }));
+        }
+        if (correctBox && !vocabPlayed && playDefBtn) {
+          playDefBtn.click();
+          vocabPlayed = true;
+        }
+        if (nextBtn && correctBox) {
+          nextBtn.click();
+          window.__ss_stats.vocabSolved++;
+          window.__ss_log('Completed vocabulary term match', 'success');
+        }
+      }, 2000);
+
+      // Connection Heartbeat
+      addLoop(function () {
+        if (window.__ss_dead || !window.__ss_state.keepAlive) return;
+        document.body.dispatchEvent(new Event('click', { bubbles: true }));
+        window.__ss_stats.keepAlivePings++;
+      }, 15000);
+
+      // Cross-frame events
+      window.addEventListener('message', function (e) {
+        if (window.__ss_dead) return;
+        if (e.data && e.data.type === 'SS_LOG') {
+          window.__ss_log(e.data.msg, e.data.logType || 'info');
+        }
+        if (e.data && e.data.type === 'SS_FILLED') {
+          window.__ss_stats.inputsHandled++;
+          window.__ss_log('Answered question: ' + (e.data.title || 'Question Item'), 'success');
+        }
+        if (e.data === 'SS_ADVANCE_REQUEST') {
+          var waitMs = (window.__ss_state.delayTransition || 2) * 1000;
+          setTimeout(function() {
+            if (!window.__ss_dead) {
+              var qNext = document.querySelector('input[value*="Next"], button.next, .btn-next, .uibtn-arrow-next');
+              if (qNext) {
+                qNext.click();
+                return;
+              }
+              var next = document.querySelector('.FrameRight') || document.querySelector('.footnav.goRight:not(.disabled)');
+              if (next) next.click();
+            }
+          }, waitMs);
+        }
+      });
+    }
   }
 
-  window.__edg_on_log = function () {
-    if (currentPage === 'logs') renderLogs();
-    if (currentPage === 'home') {
-      var el = bdoc.getElementById('val-uptime');
-      if (el) el.innerText = formatUptime();
+  // =========================================================================
+  // SECTION 2: STUDENT DASHBOARD SPOOFER & OVERDUE CLEANUP
+  // =========================================================================
+  function getCourseStableGrade(courseName, min, max) {
+    var hash = 0;
+    for (var i = 0; i < courseName.length; i++) {
+      hash = (hash << 5) - hash + courseName.charCodeAt(i);
+      hash |= 0;
     }
-  };
-
-  renderHome();
-
-  setInterval(function () {
-    if (currentPage === 'home') {
-      var el = bdoc.getElementById('val-uptime');
-      if (el) el.innerText = formatUptime();
-    }
-  }, 1000);
-
-  bdoc.querySelectorAll('.navitem').forEach(function (btn) {
-    btn.onclick = function () {
-      bdoc.querySelectorAll('.navitem').forEach(function (b) { b.classList.toggle('active', b === btn); });
-      currentPage = btn.getAttribute('data-page');
-      if (currentPage === 'home') renderHome();
-      else if (currentPage === 'settings') renderSettings();
-      else if (currentPage === 'logs') renderLogs();
-    };
-  });
-
-  function triggerEvent(el, type) {
-    var ev = new Event(type, { bubbles: true, cancelable: true });
-    el.dispatchEvent(ev);
+    var normalized = Math.abs(hash % 1000) / 1000;
+    var val = min + normalized * (max - min);
+    return val.toFixed(1) + '%';
   }
 
-  window.__edg_log('EdgeSchool active & running', 'success');
+  function getCourseStableLead(courseName) {
+    var hash = 0;
+    for (var i = 0; i < courseName.length; i++) {
+      hash = (hash << 3) - hash + courseName.charCodeAt(i);
+      hash |= 0;
+    }
+    return 2.0 + (Math.abs(hash % 70) / 10);
+  }
 
-  // 5. Automation Background Loops
-  var isClickingSlide = false;
-  addTimer(function () {
-    if (!window.__edg_state.autoClick) return;
+  function applyDashboardSpoof() {
+    if (window.__ss_dead) return;
+    var state = window.__ss_state || {
+      enableSpoof: GM_getValue('enableSpoof', false),
+      spoofMode: GM_getValue('spoofMode', 'ahead'),
+      spoofType: GM_getValue('spoofType', 'random'),
+      spoofGrade: GM_getValue('spoofGrade', '97.5%'),
+      spoofMin: GM_getValue('spoofMin', 84),
+      spoofMax: GM_getValue('spoofMax', 98),
+      hideOverdue: GM_getValue('hideOverdue', true)
+    };
 
-    var nextNav = document.querySelector('.footnav.goRight:not(.disabled)');
-    if (nextNav) {
-      nextNav.click();
-      window.__edg_stats.slidesAdvanced++;
-      window.__edg_log('Next activity clicked', 'success');
+    if (!state.enableSpoof) return;
+
+    var isAhead = (state.spoofMode === 'ahead');
+    var barColor = isAhead ? '#4caf50' : '#007bff';
+    var statusPhrase = isAhead ? 'ahead' : 'on target';
+
+    var cards = document.querySelectorAll('.course-cards .card, .sle-card');
+    cards.forEach(function (card) {
+      var courseNameEl = card.querySelector('.course-name, .card-title');
+      var courseName = courseNameEl ? courseNameEl.textContent.trim() : 'Course';
+
+      var curProgress = card.querySelector('.student-progress.current-progress');
+      var targetProgress = card.querySelector('.student-progress.target-progress');
+      var scoreEl = card.querySelector('.progress-label .score');
+      var phraseEl = card.querySelector('.progress-label .phrase');
+      var gradeEl = card.querySelector('.course-grade-text');
+      var warningsEl = card.querySelector('.course-warnings');
+
+      if (curProgress && !card.dataset.origClass) {
+        card.dataset.origClass = curProgress.className;
+        card.dataset.origProgressWidth = curProgress.style.width || '';
+        card.dataset.origProgressBg = curProgress.style.backgroundColor || '';
+      }
+      if (scoreEl && !card.dataset.origScore) card.dataset.origScore = scoreEl.textContent;
+      if (phraseEl && !card.dataset.origPhrase) card.dataset.origPhrase = phraseEl.textContent;
+      if (gradeEl && !card.dataset.origGrade) card.dataset.origGrade = gradeEl.textContent;
+
+      var targetPct = 54.55;
+      if (targetProgress && targetProgress.style.width) {
+        targetPct = parseFloat(targetProgress.style.width) || 54.55;
+      }
+
+      var distinctLead = getCourseStableLead(courseName);
+      var spoofedPct = isAhead ? Math.min(99.5, targetPct + distinctLead) : targetPct;
+      var pctString = spoofedPct.toFixed(2) + '%';
+
+      if (curProgress) {
+        curProgress.classList.remove('behind', 'ontarget', 'ahead');
+        curProgress.classList.add(isAhead ? 'ahead' : 'ontarget');
+        curProgress.style.setProperty('background-color', barColor, 'important');
+        curProgress.style.setProperty('width', pctString, 'important');
+      }
+
+      if (scoreEl) {
+        scoreEl.textContent = pctString;
+      }
+
+      if (phraseEl) {
+        phraseEl.textContent = statusPhrase;
+        phraseEl.removeAttribute('style');
+      }
+
+      if (gradeEl) {
+        if (state.spoofType === 'random') {
+          gradeEl.textContent = getCourseStableGrade(courseName, state.spoofMin || 80, state.spoofMax || 100);
+        } else {
+          gradeEl.textContent = state.spoofGrade;
+        }
+      }
+
+      if (warningsEl && state.hideOverdue) {
+        warningsEl.style.setProperty('display', 'none', 'important');
+      }
+    });
+
+    if (state.hideOverdue) {
+      document.querySelectorAll('.alert-panel, .alert-container, .alert-progress, .course-warnings').forEach(function(el) {
+        el.style.setProperty('display', 'none', 'important');
+      });
+
+      document.querySelectorAll('.ActivityTile-late, .ActivityTile-late-icon, .fa-exclamation-triangle').forEach(function(el) {
+        el.classList.remove('ActivityTile-late');
+        if (el.style) el.style.setProperty('display', 'none', 'important');
+      });
+    }
+
+    document.querySelectorAll('.edge-bar-color').forEach(function(bar) {
+      bar.classList.remove('behind');
+      bar.style.setProperty('background-color', barColor, 'important');
+      bar.style.setProperty('border-bottom-color', barColor, 'important');
+    });
+  }
+
+  function revertDashboardSpoof() {
+    var cards = document.querySelectorAll('.course-cards .card, .sle-card');
+    cards.forEach(function (card) {
+      var curProgress = card.querySelector('.student-progress.current-progress');
+      var scoreEl = card.querySelector('.progress-label .score');
+      var phraseEl = card.querySelector('.progress-label .phrase');
+      var gradeEl = card.querySelector('.course-grade-text');
+      var warningsEl = card.querySelector('.course-warnings');
+
+      if (curProgress && card.dataset.origClass) {
+        curProgress.className = card.dataset.origClass;
+        curProgress.style.backgroundColor = card.dataset.origProgressBg || '';
+        curProgress.style.width = card.dataset.origProgressWidth || '';
+      }
+      if (scoreEl && card.dataset.origScore) scoreEl.textContent = card.dataset.origScore;
+      if (phraseEl && card.dataset.origPhrase) {
+        phraseEl.textContent = card.dataset.origPhrase;
+        phraseEl.removeAttribute('style');
+      }
+      if (gradeEl && card.dataset.origGrade) gradeEl.textContent = card.dataset.origGrade;
+      if (warningsEl) warningsEl.style.display = '';
+
+      delete card.dataset.origClass;
+      delete card.dataset.origProgressWidth;
+      delete card.dataset.origProgressBg;
+      delete card.dataset.origScore;
+      delete card.dataset.origPhrase;
+      delete card.dataset.origGrade;
+    });
+
+    document.querySelectorAll('.alert-panel, .alert-container, .alert-progress, .course-warnings').forEach(function(el) {
+      el.style.display = '';
+    });
+  }
+
+  if (window.location.hostname.includes('student.edgenuity.com') || window.location.hostname.includes('core.learn.edgenuity.com')) {
+    applyDashboardSpoof();
+    window.__ss_spoof_timer = setInterval(applyDashboardSpoof, 800);
+  }
+
+
+  // =========================================================================
+  // SECTION 3: FORM FILLER & CONNECTOR / MATCHING SOLVER
+  // =========================================================================
+  var isBusy = false;
+
+  function logToParent(msg, logType) {
+    if (window === window.top) {
+      if (window.__ss_log) window.__ss_log(msg, logType || 'info');
+    } else {
+      window.top.postMessage({ type: 'SS_LOG', msg: msg, logType: logType || 'info' }, '*');
+    }
+  }
+
+  function hasActiveQuestions() {
+    // 1. Standard forms
+    var formInputs = document.querySelectorAll('select, .ui-selectmenu, input[type="radio"], input[type="checkbox"], input[type="text"]').length > 0;
+    if (formInputs) return true;
+
+    // 2. Matching / Line Connection Activity (arrows and drop-boxes)
+    var matchingElements = document.querySelectorAll('button[class*="arrow"], .arrow, .drop-box, [class*="connect"], [class*="match"], div[fdone], .done').length > 0;
+    if (matchingElements) return true;
+
+    return false;
+  }
+
+  function mountAlignedButton() {
+    if (window.__ss_dead) return;
+
+    var existingBtns = document.querySelectorAll('#ss-fill-btn');
+    if (existingBtns.length > 1) {
+      for (var i = 1; i < existingBtns.length; i++) existingBtns[i].remove();
+    }
+
+    if (!hasActiveQuestions()) {
+      if (existingBtns[0]) existingBtns[0].remove();
       return;
     }
 
-    try {
-      var innerIframe = document.querySelector('iframe:not(#edg-pixel-ui-frame)');
-      if (innerIframe && innerIframe.contentWindow && innerIframe.contentWindow.API && innerIframe.contentWindow.API.E2020) {
-        if (!innerIframe.contentWindow.API.E2020.freeMovement) {
-          innerIframe.contentWindow.API.E2020.freeMovement = true;
-          window.__edg_log('Unlocked freeMovement on activity', 'info');
-        }
-      }
-    } catch (e) {}
+    var fillButton = document.getElementById('ss-fill-btn');
+    if (!fillButton) {
+      fillButton = document.createElement('button');
+      fillButton.id = 'ss-fill-btn';
+      fillButton.type = 'button';
+      fillButton.innerHTML = `
+        <span style="display:inline-flex;align-items:center;gap:5px;font-family:Arial,Helvetica,sans-serif;font-size:12px;font-weight:bold;letter-spacing:0.2px;">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" style="color:#ffffff;">
+            <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/>
+          </svg>
+          <span id="ss-fill-btn-text">Auto Fill</span>
+        </span>
+      `;
 
-    var curFrame = document.querySelector('.FrameCurrent.FrameComplete');
-    var nextSlide = document.querySelector('.FrameRight');
-    if (curFrame && nextSlide && !isClickingSlide) {
-      isClickingSlide = true;
-      nextSlide.click();
-      window.__edg_stats.slidesAdvanced++;
-      window.__edg_log('Advanced completed slide', 'success');
+      Object.assign(fillButton.style, {
+        height: '30px',
+        padding: '0 12px',
+        borderRadius: '3px',
+        background: 'linear-gradient(to bottom, #c5221f 0%, #a51d24 100%)',
+        color: '#ffffff',
+        border: '1px solid #7c141a',
+        borderBottomColor: '#530c10',
+        boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.25), 0 1px 2px rgba(0,0,0,0.25)',
+        textShadow: '0 -1px 0 rgba(0,0,0,0.3)',
+        cursor: 'pointer',
+        outline: 'none',
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        verticalAlign: 'middle',
+        boxSizing: 'border-box',
+        marginRight: '8px',
+        marginLeft: '4px'
+      });
+
+      fillButton.onmouseenter = function() { this.style.background = 'linear-gradient(to bottom, #d93025 0%, #b31412 100%)'; };
+      fillButton.onmouseleave = function() { this.style.background = 'linear-gradient(to bottom, #c5221f 0%, #a51d24 100%)'; };
+      fillButton.onmousedown = function() { this.style.transform = 'translateY(1px)'; };
+      fillButton.onmouseup = function() { this.style.transform = 'none'; };
+
+      fillButton.onclick = function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        executeFill();
+      };
+    }
+
+    var nextBtn = document.querySelector('input[value*="Next"], button.next, .btn-next, .FrameRight, .footnav.goRight, .uibtn-arrow-next, [title*="Next"]')
+               || Array.from(document.querySelectorAll('input, button, a')).find(function (el) {
+                    var val = (el.value || el.textContent || '').trim().toLowerCase();
+                    return val === 'next' || val.startsWith('next ');
+                  });
+
+    var doneTarget = document.querySelector('div[fdone], .done, [title="done"], input[value="Check"]');
+    var saveExitBtn = document.querySelector('input[value*="Save and Exit"], .btn-save-exit');
+
+    if (nextBtn && nextBtn.parentElement) {
+      if (fillButton.parentElement !== nextBtn.parentElement || fillButton.nextElementSibling !== nextBtn) {
+        nextBtn.parentElement.insertBefore(fillButton, nextBtn);
+      }
+      fillButton.style.position = 'relative';
+      fillButton.style.top = 'auto';
+      fillButton.style.bottom = 'auto';
+      fillButton.style.left = 'auto';
+      fillButton.style.right = 'auto';
+    } else if (doneTarget && doneTarget.parentElement) {
+      if (fillButton.parentElement !== doneTarget.parentElement) {
+        doneTarget.parentElement.insertBefore(fillButton, doneTarget);
+      }
+      fillButton.style.position = 'relative';
+      fillButton.style.top = 'auto';
+      fillButton.style.bottom = 'auto';
+      fillButton.style.left = 'auto';
+      fillButton.style.right = 'auto';
+    } else if (saveExitBtn && saveExitBtn.parentElement) {
+      if (fillButton.parentElement !== saveExitBtn.parentElement) {
+        saveExitBtn.parentElement.insertBefore(fillButton, saveExitBtn);
+      }
+      fillButton.style.position = 'relative';
+      fillButton.style.top = 'auto';
+      fillButton.style.bottom = 'auto';
+      fillButton.style.left = 'auto';
+      fillButton.style.right = 'auto';
+    } else {
+      if (!fillButton.parentElement) document.body.appendChild(fillButton);
+      Object.assign(fillButton.style, {
+        position: 'fixed',
+        bottom: '12px',
+        right: '120px',
+        zIndex: '2147483647'
+      });
+    }
+  }
+
+  // Mount on load
+  window.addEventListener('load', function () {
+    setTimeout(mountAlignedButton, 300);
+    window.__ss_mount_timer = setInterval(mountAlignedButton, 1200);
+
+    if (window.__ss_dead) return;
+    var isAuto = GM_getValue('assistAutoFill', true);
+    if (isAuto) {
+      var pauseSec = (GM_getValue('delayProcessing', 2) || 2) * 1000;
       setTimeout(function () {
-        isClickingSlide = false;
-      }, 600);
-    }
-  }, 1000);
-
-  addTimer(function () {
-    if (!window.__edg_state.skipIntros) return;
-    var invis = document.getElementById('invis-o-div');
-    if (invis) {
-      invis.remove();
-      window.__edg_log('Removed invis-o-div overlay', 'info');
-    }
-    var err = document.getElementById('uid1_errorMessage');
-    if (err) {
-      err.remove();
-      window.__edg_log('Cleared audio error dialog', 'info');
-    }
-  }, 1500);
-
-  var alreadyPlayedCheck = false;
-  addTimer(function () {
-    if (!window.__edg_state.autoDefi) return;
-    var normalTextBox = document.querySelector('.word-textbox.word-normal');
-    var correctTextBox = document.querySelector('.word-textbox.word-correct');
-    var normalTextBtn = document.querySelector('.plainbtn.alt.blue.selected');
-    var firstDefBtn = document.querySelector('.playbutton.vocab-play');
-    var nextBtn = document.querySelector('.uibtn.uibtn-blue.uibtn-arrow-next');
-
-    if (normalTextBox && !correctTextBox && normalTextBtn) {
-      normalTextBox.value = normalTextBtn.textContent || normalTextBtn.innerText;
-      alreadyPlayedCheck = false;
-      triggerEvent(normalTextBox, 'keyup');
-      window.__edg_log('Entered vocab definition', 'info');
-    }
-    if (correctTextBox && !alreadyPlayedCheck && firstDefBtn) {
-      firstDefBtn.click();
-      alreadyPlayedCheck = true;
-    }
-    if (nextBtn && correctTextBox) {
-      nextBtn.click();
-      window.__edg_stats.vocabCompleted++;
-      window.__edg_log('Vocab question completed', 'success');
-    }
-  }, 2000);
-
-  addTimer(function () {
-    if (!window.__edg_state.antiAfk) return;
-    triggerEvent(document.body, 'click');
-    window.__edg_stats.afkPings++;
-  }, 15000);
-
-  // Shortcut key: Ctrl + Shift + \
-  window.addEventListener('keydown', function (e) {
-    if (e.ctrlKey && e.shiftKey && e.key === '\\') {
-      var f = document.getElementById('edg-pixel-ui-frame');
-      var d = document.getElementById('edg-pixel-dock');
-      if (!f || !d) return;
-      if (f.style.display === 'none' || f.style.opacity === '0') {
-        restoreWindow();
-      } else {
-        minimizeWindow();
-      }
+        if (!window.__ss_dead) executeFill();
+      }, pauseSec);
     }
   });
+
+  // Base64 helper for Gemini Vision
+  function fetchImageBase64(imgUrl) {
+    return new Promise(function(resolve) {
+      if (!imgUrl || imgUrl.startsWith('data:')) {
+        return resolve(imgUrl ? imgUrl.split(',')[1] : null);
+      }
+      if (imgUrl.startsWith('//')) imgUrl = window.location.protocol + imgUrl;
+
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: imgUrl,
+        responseType: 'blob',
+        onload: function(res) {
+          if (res.status === 200 && res.response) {
+            var reader = new FileReader();
+            reader.onloadend = function() {
+              var b64 = reader.result ? reader.result.split(',')[1] : null;
+              resolve(b64);
+            };
+            reader.readAsDataURL(res.response);
+          } else {
+            resolve(null);
+          }
+        },
+        onerror: function() { resolve(null); }
+      });
+    });
+  }
+
+  async function executeFill() {
+    if (isBusy || window.__ss_dead) return;
+    var token = getActiveKey();
+    if (!token) {
+      token = prompt('Please paste your Gemini API Key(s) separated by commas:');
+      if (token) {
+        setStoredKeys(token);
+      } else {
+        logToParent('Auto Fill cancelled: No API key provided.', 'warn');
+        return;
+      }
+    }
+
+    if (!hasActiveQuestions()) {
+      logToParent('No interactive questions found on current slide.', 'info');
+      if (!window.__ss_dead) proceedWhenAudioFinished();
+      return;
+    }
+
+    isBusy = true;
+    var btnText = document.getElementById('ss-fill-btn-text');
+    if (btnText) btnText.textContent = 'Resolving...';
+    var fillBtn = document.getElementById('ss-fill-btn');
+    if (fillBtn) fillBtn.style.filter = 'brightness(0.85)';
+    logToParent('Analyzing question & formulas...', 'info');
+
+    try {
+      var context = extractContext();
+
+      // Check for diagram or math formula image
+      var imageB64 = null;
+      var diagramImg = document.querySelector('img[src*="contentengine"], img[src*="Assessment"], .content img, #main img, table img, .question img');
+      if (diagramImg && diagramImg.src && !diagramImg.src.includes('button') && !diagramImg.src.includes('icon')) {
+        logToParent('Scanning formulas with Vision...', 'info');
+        imageB64 = await fetchImageBase64(diagramImg.src);
+      }
+
+      var result = await requestAnswers(context, imageB64);
+      if (window.__ss_dead) return;
+
+      populateAnswers(result.answers);
+      if (window === window.top) {
+        if (window.__ss_stats) window.__ss_stats.inputsHandled++;
+        if (window.__ss_log) window.__ss_log('Answered question: ' + document.title, 'success');
+      } else {
+        window.top.postMessage({ type: 'SS_FILLED', title: document.title }, '*');
+      }
+      if (btnText) btnText.textContent = 'Done!';
+
+      var commit = GM_getValue('autoCommit', true);
+      if (commit && !window.__ss_dead) {
+        setTimeout(function () {
+          if (window.__ss_dead) return;
+          var doneBtn = document.querySelector('div[fdone], .done, input[value="Check"], button.check-answer, [title="done"]');
+          if (doneBtn) doneBtn.click();
+          else if (window.API && window.API.Question && typeof window.API.Question.attempt === 'function') {
+            try { window.API.Question.attempt(doneBtn); } catch (_) {}
+          }
+
+          var qNext = document.querySelector('input[value*="Next"], button.next, .btn-next');
+          if (qNext) {
+            setTimeout(function() {
+              if (!window.__ss_dead) qNext.click();
+            }, 1200);
+          } else if (!window.__ss_dead) {
+            setTimeout(proceedWhenAudioFinished, 1500);
+          }
+        }, 1000);
+      }
+
+    } catch (err) {
+      logToParent('API Error: ' + err.message, 'warn');
+      if (btnText) btnText.textContent = 'Error';
+      console.error('[StudySync] Resolution error:', err);
+    } finally {
+      if (fillBtn) fillBtn.style.filter = 'none';
+      setTimeout(function () {
+        if (btnText) btnText.textContent = 'Auto Fill';
+        isBusy = false;
+      }, 2500);
+    }
+  }
+
+  function extractContext() {
+    var container = document.querySelector('#main, form, .content, #assessment-container, body') || document.body;
+    var text = (container.innerText || container.textContent).trim();
+    var options = [];
+
+    // 1. Selects & Dropdowns
+    document.querySelectorAll('select').forEach(function (sel, i) {
+      var opts = Array.from(sel.options).map(function (o) { return o.text.trim(); }).filter(Boolean);
+      if (opts.length) options.push('Dropdown #' + (i + 1) + ': [' + opts.join(', ') + ']');
+    });
+
+    // 2. Multiple Choice Radio & Checkbox Items
+    document.querySelectorAll('input[type="radio"], input[type="checkbox"]').forEach(function (inp, i) {
+      var label = inp.closest('label')
+               || (inp.id ? document.querySelector('label[for="' + inp.id + '"]') : null)
+               || inp.parentElement;
+      var choiceText = label ? label.innerText.trim() : inp.value;
+      if (choiceText) options.push('Choice #' + (i + 1) + ': ' + choiceText);
+    });
+
+    // 3. Matching Activity Extraction (Left expressions & Right expressions)
+    var matchSources = Array.from(document.querySelectorAll('.source, .left-col div, tr td:first-child'));
+    var matchTargets = Array.from(document.querySelectorAll('.target, .right-col div, tr td:last-child'));
+    if (matchSources.length && matchTargets.length) {
+      options.push('Matching Left Items: ' + matchSources.map(function(s, idx){ return '[' + (idx+1) + '] ' + s.textContent.trim(); }).join('; '));
+      options.push('Matching Right Items: ' + matchTargets.map(function(t, idx){ return '[' + (idx+1) + '] ' + t.textContent.trim(); }).join('; '));
+    }
+
+    return { text: text, options: options.join('\n'), html: container.innerHTML.substring(0, 4500) };
+  }
+
+  function requestAnswers(ctx, imageB64, retryCount) {
+    retryCount = retryCount || 0;
+    var apiKey = getActiveKey();
+
+    return new Promise(function (resolve, reject) {
+      var promptText = "Read the question, choices, math formulas, and any diagram/image provided.\n" +
+                       "Determine the exact correct answer for every question element.\n" +
+                       "If this is a matching problem, match each item 1..N on the left to its corresponding 1..N slot on the right.\n\n" +
+                       "Question Text:\n" + ctx.text + "\n\n" +
+                       "Available Choices:\n" + ctx.options + "\n\n" +
+                       "Return a JSON object conforming strictly to this format:\n" +
+                       "{\"answers\": [{\"index\": 1, \"answer\": \"exact choice text\", \"matchTarget\": 4}]}";
+
+      var parts = [{ text: promptText }];
+      if (imageB64) {
+        parts.push({
+          inline_data: {
+            mime_type: "image/png",
+            data: imageB64
+          }
+        });
+      }
+
+      var model = (retryCount > 0) ? 'gemini-2.5-flash-lite' : 'gemini-2.5-flash';
+
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + apiKey,
+        headers: { 'Content-Type': 'application/json' },
+        data: JSON.stringify({
+          contents: [{ parts: parts }],
+          generationConfig: {
+            response_mime_type: "application/json"
+          }
+        }),
+        onload: function (res) {
+          if (res.status === 429) {
+            rotateKey();
+            if (retryCount < 3) {
+              logToParent('Quota hit, rotating key slot and retrying in 2s...', 'warn');
+              return setTimeout(function() {
+                resolve(requestAnswers(ctx, imageB64, retryCount + 1));
+              }, 2000);
+            }
+          }
+
+          if (res.status !== 200) {
+            return reject(new Error('HTTP ' + res.status + ' (' + res.responseText.substring(0, 80) + ')'));
+          }
+          try {
+            var raw = JSON.parse(res.responseText);
+            if (raw.error) return reject(new Error(raw.error.message || 'API Error'));
+            var cand = raw.candidates && raw.candidates[0];
+            if (!cand || !cand.content || !cand.content.parts || !cand.content.parts[0]) {
+              return reject(new Error('Empty answer from model'));
+            }
+            var text = cand.content.parts[0].text.trim();
+            var jsonMatch = text.match(/\{[\s\S]*\}/);
+            if (!jsonMatch) {
+              return reject(new Error('Invalid format: ' + text.substring(0, 40)));
+            }
+            resolve(JSON.parse(jsonMatch[0]));
+          } catch (e) {
+            reject(new Error(e.message));
+          }
+        },
+        onerror: function () {
+          rotateKey();
+          reject(new Error('Network fault contacting Google API'));
+        }
+      });
+    });
+  }
+
+  // Connector Helper for Matching Lines / Drag & Drop
+  function simulateConnection(sourceEl, targetEl) {
+    if (!sourceEl || !targetEl) return;
+
+    // 1. Click source handle
+    sourceEl.scrollIntoView({ block: 'nearest' });
+    sourceEl.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    sourceEl.click();
+
+    // 2. Click destination target box
+    setTimeout(function () {
+      targetEl.scrollIntoView({ block: 'nearest' });
+      targetEl.dispatchEvent(new MouseEvent('mousemove', { bubbles: true }));
+      targetEl.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+      targetEl.click();
+
+      // If jQuery UI droppable exists
+      if (window.jQuery && window.jQuery(targetEl).data('droppable')) {
+        try {
+          window.jQuery(targetEl).trigger('drop', [ { draggable: window.jQuery(sourceEl) } ]);
+        } catch (_) {}
+      }
+    }, 150);
+  }
+
+  function populateAnswers(answers) {
+    if (!answers || !answers.length || window.__ss_dead) return;
+
+    // 1. Check for Matching / Line Connector Activity (like dividing fractions)
+    var arrowButtons = Array.from(document.querySelectorAll('button img[src*="arrow"], button:has(svg), .arrow, button.btn-arrow, a.arrow, [class*="arrow"]'))
+      .filter(function(el) { return el.id !== 'ss-dock-btn' && !el.closest('#studysync-container'); });
+
+    var dropBoxes = Array.from(document.querySelectorAll('.target, .drop-box, [class*="drop"], div[class*="square"], div[class*="box"]:empty, .ui-droppable'))
+      .filter(function(el) { return !el.closest('#studysync-container'); });
+
+    if (arrowButtons.length >= 2 && dropBoxes.length >= 2) {
+      logToParent('Connecting matching pairs...', 'info');
+      answers.forEach(function (item, idx) {
+        var srcBtn = arrowButtons[idx];
+        var targetIndex = (typeof item.matchTarget === 'number') ? (item.matchTarget - 1) : idx;
+        var destBox = dropBoxes[targetIndex] || dropBoxes[idx];
+        if (srcBtn && destBox) {
+          setTimeout(function() {
+            simulateConnection(srcBtn, destBox);
+          }, idx * 400);
+        }
+      });
+      return;
+    }
+
+    // 2. Standard Forms & Radios
+    answers.forEach(function (item, idx) {
+      var rawTarget = (item.answer || '').trim();
+      var target = rawTarget.toLowerCase();
+
+      // Radios & Checkboxes
+      var radios = Array.from(document.querySelectorAll('input[type="radio"], input[type="checkbox"]'));
+      var matchedRadio = false;
+
+      for (let box of radios) {
+        var label = box.closest('label')
+                 || (box.id ? document.querySelector('label[for="' + box.id + '"]') : null)
+                 || box.parentElement;
+        var container = box.closest('.answer-choice, .choice, li, tr, div') || box.parentElement;
+        var labelText = (container ? container.innerText : (label ? label.innerText : box.value)).trim().toLowerCase();
+
+        if (labelText === target || labelText.includes(target) || target.includes(labelText)) {
+          box.checked = true;
+          box.click();
+          box.dispatchEvent(new Event('change', { bubbles: true }));
+          box.dispatchEvent(new Event('click', { bubbles: true }));
+          if (label) label.click();
+          if (container && container !== label && container !== box) container.click();
+          matchedRadio = true;
+          break;
+        }
+      }
+
+      if (!matchedRadio) {
+        document.querySelectorAll('.answer-choice, .choice-row, .mc-option, li.choice').forEach(function(el) {
+          var elText = el.innerText.trim().toLowerCase();
+          if (elText === target || elText.includes(target) || target.includes(elText)) {
+            el.click();
+          }
+        });
+      }
+
+      // Dropdowns
+      var selects = Array.from(document.querySelectorAll('select'));
+      if (selects[idx]) {
+        var sel = selects[idx];
+        for (let opt of sel.options) {
+          var optText = opt.text.trim().toLowerCase();
+          var optVal = opt.value.trim().toLowerCase();
+          if (optText === target || optVal === target || optText.includes(target) || target.includes(optText)) {
+            sel.value = opt.value;
+            sel.dispatchEvent(new Event('change', { bubbles: true }));
+            if (window.jQuery && window.jQuery(sel).data('selectmenu')) {
+              try {
+                window.jQuery(sel).selectmenu('value', opt.value);
+                window.jQuery(sel).selectmenu('refresh', true);
+              } catch (_) {}
+            }
+            break;
+          }
+        }
+      }
+
+      // Free-Form Text Fields
+      var inputs = document.querySelectorAll('input[type="text"]:not([readonly]), textarea');
+      if (inputs[idx]) {
+        inputs[idx].value = item.answer;
+        inputs[idx].dispatchEvent(new Event('input', { bubbles: true }));
+        inputs[idx].dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    });
+  }
+
+  function proceedWhenAudioFinished() {
+    if (window.__ss_dead) return;
+    var audio = document.querySelector('audio');
+    if (audio && !audio.paused && !audio.ended) {
+      audio.onended = function () { if (!window.__ss_dead) window.top.postMessage('SS_ADVANCE_REQUEST', '*'); };
+      setTimeout(function () { if (!window.__ss_dead) window.top.postMessage('SS_ADVANCE_REQUEST', '*'); }, 12000);
+    } else {
+      window.top.postMessage('SS_ADVANCE_REQUEST', '*');
+    }
+  }
 })();
