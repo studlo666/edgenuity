@@ -16,6 +16,7 @@ A Tampermonkey userscript built to streamline navigation, automate form filling 
 ## Keyboard Shortcuts
 
 | Shortcut | Action |
+| :--- | :--- |
 | `Shift + /` | Toggle UI container visibility[cite: 1] |
 | `Shift + \` | Panic kill script instantly across all frames[cite: 1] |
 
